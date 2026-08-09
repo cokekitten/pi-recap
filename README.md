@@ -2,6 +2,8 @@
 
 [中文文档](./README.zh-CN.md)
 
+**Repo:** https://github.com/cokekitten/pi-recap
+
 > **About this repo** — standalone repo derived from [`@zhcsyncer/pi-recap`](https://github.com/zhcsyncer/pi-extensions/tree/main/packages/pi-recap) (the `pi-recap` package in the `zhcsyncer/pi-extensions` monorepo). Maintained independently; changes are cosmetic only (compact UI), no behavior/logic changes:
 >
 > - **Single-line recap widget**: success rendering changed from a multi-line block (title + body + generated-time) to a single line — `※ recap {time} {body}`.
@@ -24,29 +26,29 @@ Features:
 
 ### Installation
 
-Install the whole `zhcsyncer/pi-extensions` bundle from Git:
+From GitHub:
 
 ```bash
-pi install git:github.com/zhcsyncer/pi-extensions
+pi install git:github.com/cokekitten/pi-recap
 ```
 
-Try without installing:
+Or try it for one run without installing:
 
 ```bash
-pi -e git:github.com/zhcsyncer/pi-extensions
+pi -e git:github.com/cokekitten/pi-recap
 ```
 
-Install from npm:
+Local checkout:
 
 ```bash
-pi install npm:@zhcsyncer/pi-recap
+# e.g. in ~/.pi/agent/settings.json packages:
+#   "../../dev/pi-expansion/pi-recap"
+pi install /path/to/pi-recap
+# or
+pi -e /path/to/pi-recap
 ```
 
-Local development:
-
-```bash
-pi -e ./packages/pi-recap
-```
+After installing, restart pi or run `/reload`.
 
 ### Commands
 
@@ -329,3 +331,7 @@ or MP4 video:
   }
 }
 ```
+
+## License
+
+MIT
