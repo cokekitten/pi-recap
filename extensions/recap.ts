@@ -767,7 +767,13 @@ function showRecapProgress(ctx: ExtensionContext, config: RecapConfig) {
 }
 
 function displayRecapError(ctx: ExtensionContext, config: RecapConfig, message: string) {
-	if (ctx.mode !== "tui") return;
+	if (ctx.mode !== "tui") {
+		// RPC（pi-web 等）：factory 形式的 widget 不可见——错误用 widgetLines 下发，
+		// 顺带把 showRecapProgress 留下的 "Generating..." 覆盖掉
+		clearRecapDisplay(ctx);
+		ctx.ui.setWidget(WIDGET_KEY, [`※ recap  Failed — ${message}`], { placement: config.display.widgetPlacement });
+		return;
+	}
 	clearRecapDisplay(ctx);
 	ctx.ui.setWidget(
 		WIDGET_KEY,
@@ -782,7 +788,15 @@ function displayRecapError(ctx: ExtensionContext, config: RecapConfig, message: 
 }
 
 function displayRecapWidget(ctx: ExtensionContext, config: RecapConfig, data: RecapEntryData) {
-	if (ctx.mode !== "tui") return;
+	if (ctx.mode !== "tui") {
+		// RPC（pi-web 等）：widgetLines 下发结果（web 端条带原样显示），不再返回不可见的 factory
+		const generatedTime = new Intl.DateTimeFormat(undefined, {
+			hour: "2-digit",
+			minute: "2-digit",
+		}).format(data.generatedAt);
+		ctx.ui.setWidget(WIDGET_KEY, [`※ recap  ${generatedTime} ${data.recap}`], { placement: config.display.widgetPlacement });
+		return;
+	}
 
 	ctx.ui.setWidget(
 		WIDGET_KEY,
