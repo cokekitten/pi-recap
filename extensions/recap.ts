@@ -13,7 +13,36 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, open, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { complete } from "@earendil-works/pi-ai/compat";
+import type { complete } from "@earendil-works/pi-ai/compat";
+
+type RecapCompletion = typeof complete;
+
+let recapCompletionForTesting: RecapCompletion | undefined;
+
+/** Test seam for deterministic recap completion responses. */
+export function setRecapCompletionForTesting(
+	override: RecapCompletion,
+): () => void {
+	const previous = recapCompletionForTesting;
+	recapCompletionForTesting = override;
+	return () => {
+		if (recapCompletionForTesting === override) {
+			recapCompletionForTesting = previous;
+		}
+	};
+}
+
+function completeRecap(
+	ctx: ExtensionContext,
+	model: NonNullable<ExtensionContext["model"]>,
+	context: Parameters<RecapCompletion>[1],
+	options: Parameters<RecapCompletion>[2],
+): ReturnType<RecapCompletion> {
+	if (recapCompletionForTesting) {
+		return recapCompletionForTesting(model, context, options);
+	}
+	return ctx.modelRegistry.complete(model, context, options);
+}
 import {
 	CONFIG_DIR_NAME,
 	getAgentDir,
@@ -595,6 +624,57 @@ function formatModelName(model: NonNullable<ExtensionContext["model"]> | undefin
 	return model ? `${model.provider}/${model.id}` : undefined;
 }
 
+function safeRecapModelName(model: unknown): string {
+	if (!isRecord(model) || typeof model.provider !== "string" || typeof model.id !== "string") return "unknown-model";
+	const valid = /^[A-Za-z0-9._/-]{1,128}$/;
+	return valid.test(model.provider) && valid.test(model.id) ? `${model.provider}/${model.id}` : "unknown-model";
+}
+
+function safeStopReason(value: unknown): string {
+	switch (value) {
+		case "stop": return "stop";
+		case "length": return "length";
+		case "tool_use": return "tool-use";
+		case "error": return "error";
+		case "aborted": return "aborted";
+		default: return "unknown";
+	}
+}
+
+function safeContentType(value: unknown): string {
+	switch (value) {
+		case "text": return "text";
+		case "thinking": return "thinking";
+		case "toolCall": return "tool-call";
+		case "image": return "image";
+		default: return "unknown";
+	}
+}
+
+type RecapResponse = Awaited<ReturnType<RecapCompletion>>;
+type RecapResponseDetails = { raw: string; reason: string; types: string[] };
+
+function inspectRecapResponse(response: RecapResponse): RecapResponseDetails {
+	const parts: string[] = [];
+	const types: string[] = [];
+	for (const item of response.content) {
+		if (!isRecord(item)) {
+			types.push("unknown");
+			continue;
+		}
+		types.push(safeContentType(item.type));
+		if (item.type === "text" && typeof item.text === "string") parts.push(item.text);
+	}
+	return { raw: parts.join("\n").trim(), reason: safeStopReason(response.stopReason), types };
+}
+
+function emptyOutputDiagnostic(model: unknown, attempts: RecapResponseDetails[]): string {
+	const summary = attempts
+		.map((attempt, index) => `attempt ${index + 1}: reason=${attempt.reason}, types=${attempt.types.join(",") || "none"}`)
+		.join("; ");
+	return `Recap model returned empty output (${safeRecapModelName(model)}; ${summary})`;
+}
+
 type RunRecapOptions = {
 	force?: boolean;
 	signal?: AbortSignal;
@@ -655,51 +735,47 @@ async function runRecap(
 	if (showProgress) showRecapProgress(ctx, config);
 
 	try {
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (!isCurrentRecapRun(state, run)) return undefined;
-		if (!auth.ok) {
-			const message = "error" in auth ? auth.error : `Failed to resolve API key for ${model.provider}`;
-			displayRecapError(ctx, config, message);
-			displayed = true;
-			return undefined;
+		const completionContext = {
+			systemPrompt: buildSystemPrompt(config),
+			messages: [
+				{
+					role: "user" as const,
+					content: [{ type: "text" as const, text: source.conversation }],
+					timestamp: Date.now(),
+				},
+			],
+		};
+		const completionOptions = {
+			maxTokens: config.recap.maxTokens,
+			signal: runSignal,
+		};
+		const emptyAttempts: RecapResponseDetails[] = [];
+		let raw: string | undefined;
+
+		for (let attempt = 0; attempt < 2; attempt++) {
+			if (!isCurrentRecapRun(state, run)) return undefined;
+			const response = await completeRecap(ctx, model, completionContext, completionOptions);
+			if (!isCurrentRecapRun(state, run) || response.stopReason === "aborted") return undefined;
+			if (response.stopReason === "error") {
+				displayRecapError(
+					ctx,
+					config,
+					`Recap model request failed (${safeRecapModelName(model)}; reason=error)`,
+				);
+				displayed = true;
+				return undefined;
+			}
+
+			const details = inspectRecapResponse(response);
+			if (details.raw) {
+				raw = details.raw;
+				break;
+			}
+			emptyAttempts.push(details);
 		}
-		if (!auth.apiKey) {
-			displayRecapError(ctx, config, `No API key for ${model.provider}`);
-			displayed = true;
-			return undefined;
-		}
-
-		const response = await complete(
-			model,
-			{
-				systemPrompt: buildSystemPrompt(config),
-				messages: [
-					{
-						role: "user" as const,
-						content: [{ type: "text" as const, text: source.conversation }],
-						timestamp: Date.now(),
-					},
-				],
-			},
-			{
-				apiKey: auth.apiKey,
-				headers: auth.headers,
-				env: auth.env,
-				maxTokens: config.recap.maxTokens,
-				signal: runSignal,
-			},
-		);
-
-		if (!isCurrentRecapRun(state, run) || response.stopReason === "aborted") return undefined;
-
-		const raw = response.content
-			.filter((item): item is { type: "text"; text: string } => item.type === "text")
-			.map((item) => item.text)
-			.join("\n")
-			.trim();
 
 		if (!raw) {
-			displayRecapError(ctx, config, "Recap model returned empty output");
+			displayRecapError(ctx, config, emptyOutputDiagnostic(model, emptyAttempts));
 			displayed = true;
 			return undefined;
 		}
