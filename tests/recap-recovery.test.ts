@@ -14,6 +14,7 @@ type Harness = {
 	widgets: unknown[];
 	lastWidget: unknown;
 	model: unknown;
+	hostCompletionCalls: Array<[unknown, unknown, unknown]>;
 	invokeRecap(): Promise<void>;
 	invokeEvent(name: string): Promise<void>;
 	widgetText(): string;
@@ -26,6 +27,7 @@ const TOOL_ARGUMENT_SENTINEL = "TOOL_ARGUMENT_MUST_NOT_LEAK";
 const STOP_REASON_SENTINEL = "STOP_REASON_MUST_NOT_LEAK";
 const CONTENT_TYPE_SENTINEL = "CONTENT_TYPE_MUST_NOT_LEAK";
 const MODEL_SENTINEL = "MODEL_ID_MUST_NOT_LEAK";
+const PROVIDER_ERROR_SENTINEL = "PROVIDER_ERROR_DETAIL_MUST_NOT_LEAK";
 
 function completionResponse(content: unknown[], stopReason: unknown = "stop"): any {
 	return {
@@ -53,8 +55,9 @@ function createHarness(
 		mode?: "rpc" | "tui";
 		signal?: AbortSignal;
 		model?: unknown;
-		getAuth?: () => Promise<unknown>;
+		complete?: (model: unknown, context: unknown, options: unknown) => Promise<unknown>;
 		onCustomComponent?: (component: { handleInput(data: string): void }) => void;
+		onWidgetUpdate?: (widget: unknown) => void;
 	} = {},
 ): Harness {
 	const commands = new Map<string, CommandHandler>();
@@ -63,6 +66,7 @@ function createHarness(
 	const titles: string[] = [];
 	const widgets: unknown[] = [];
 	let lastWidget: unknown;
+	const hostCompletionCalls: Array<[unknown, unknown, unknown]> = [];
 	const model = options.model ?? { provider: "safe.provider", id: "recap-v1", api: "test-api" };
 	const tui = { requestRender() {} };
 	const theme = {
@@ -127,6 +131,7 @@ function createHarness(
 			setWidget(_key: string, widget: unknown) {
 				widgets.push(widget);
 				lastWidget = widget;
+				options.onWidgetUpdate?.(widget);
 			},
 			async custom(factory: (...args: any[]) => { dispose?(): void }) {
 				return await new Promise<unknown>((resolve, reject) => {
@@ -152,14 +157,10 @@ function createHarness(
 			getSessionId: () => "session-1",
 		},
 		modelRegistry: {
-			getApiKeyAndHeaders:
-				options.getAuth ??
-				(async () => ({
-					ok: true,
-					apiKey: API_KEY_SENTINEL,
-					headers: { "x-sensitive-header": HEADER_SENTINEL },
-					env: { TEST_SECRET: "ENV_VALUE_MUST_NOT_LEAK" },
-				})),
+			async complete(model: unknown, completionContext: unknown, completionOptions: unknown) {
+				hostCompletionCalls.push([model, completionContext, completionOptions]);
+				return await (options.complete?.(model, completionContext, completionOptions) ?? completionResponse([{ type: "text", text: '{"recap":"Host recap"}' }]));
+			},
 		},
 	} as unknown as ExtensionCommandContext;
 
@@ -174,6 +175,7 @@ function createHarness(
 			return lastWidget;
 		},
 		model,
+		hostCompletionCalls,
 		async invokeRecap() {
 			const handler = commands.get("recap");
 			assert.ok(handler, "the extension must register /recap");
@@ -195,11 +197,55 @@ function createHarness(
 	};
 }
 
+test("/recap uses the Pi host model registry completion with its selected model, token limit, and cancellation signal", async () => {
+	const harness = createHarness();
+
+	await harness.invokeRecap();
+
+	assert.equal(harness.hostCompletionCalls.length, 1);
+	const [model, context, options] = harness.hostCompletionCalls[0]!;
+	assert.equal(model, harness.model);
+	assert.ok(context && typeof context === "object", "host completion must receive the recap context");
+	assert.equal((options as { maxTokens?: unknown }).maxTokens, 300);
+	assert.ok((options as { signal?: unknown }).signal instanceof AbortSignal, "host completion must receive the recap cancellation signal");
+	assert.equal(harness.entries.length, 1);
+	assert.equal((harness.entries[0]!.data as { recap: string }).recap, "Host recap");
+});
+
+test("a provider error response is not retried and exposes only a fixed safe request-failure diagnostic", async () => {
+	const harness = createHarness({
+		complete: async () => ({
+			...completionResponse([], "error"),
+			errorMessage: PROVIDER_ERROR_SENTINEL,
+		}),
+	});
+
+	await harness.invokeRecap();
+
+	assert.equal(harness.hostCompletionCalls.length, 1);
+	assert.deepEqual(harness.entries, []);
+	assert.deepEqual(harness.titles, []);
+	const widget = harness.widgetText();
+	assert.match(widget, /request failed/i);
+	assert.doesNotMatch(widget, /empty output/i);
+	for (const forbidden of [
+		PROVIDER_ERROR_SENTINEL,
+		SESSION_SENTINEL,
+		HEADER_SENTINEL,
+		API_KEY_SENTINEL,
+		"RESPONSE_ID_MUST_NOT_LEAK",
+		"RESPONSE_ERROR_MUST_NOT_LEAK",
+	]) {
+		assert.doesNotMatch(widget, new RegExp(forbidden));
+	}
+});
+
 function assertNoRecapSideEffects(harness: Harness): void {
 	assert.deepEqual(harness.entries, []);
 	assert.deepEqual(harness.titles, []);
 	assert.equal(harness.lastWidget, undefined, "an inactive or aborted run must clear its recap display");
 }
+
 
 test("/recap retries one empty completion with the same model and parameters, then persists the retry text", async () => {
 	const harness = createHarness();
@@ -323,20 +369,42 @@ test("aborted responses and cancelled manual runs do not retry or render an empt
 
 	await t.test("manual signal cancellation after completion", async () => {
 		let loader: { handleInput(data: string): void } | undefined;
+		let cancelled = false;
+		let observeBackgroundClear!: () => void;
+		const backgroundCleared = new Promise<void>((resolve) => {
+			observeBackgroundClear = resolve;
+		});
 		const harness = createHarness({
 			onCustomComponent(component) {
 				loader = component;
 			},
+			onWidgetUpdate(widget) {
+				if (cancelled && widget === undefined) observeBackgroundClear();
+			},
+		});
+		let releaseCompletion!: (response: any) => void;
+		const completion = new Promise<any>((resolve) => {
+			releaseCompletion = resolve;
+		});
+		let observeCompletionStart!: () => void;
+		const completionStarted = new Promise<void>((resolve) => {
+			observeCompletionStart = resolve;
 		});
 		let calls = 0;
 		const restore = setRecapCompletionForTesting(async () => {
 			calls++;
-			assert.ok(loader, "the manual recap loader must be mounted before completion");
-			loader.handleInput("\x1b");
-			return completionResponse([]);
+			observeCompletionStart();
+			return await completion;
 		});
 		try {
-			await harness.invokeRecap();
+			const recapCommand = harness.invokeRecap();
+			await completionStarted;
+			assert.ok(loader, "the manual recap loader must be mounted before completion completes");
+			cancelled = true;
+			loader.handleInput("\x1b");
+			await recapCommand;
+			releaseCompletion(completionResponse([]));
+			await backgroundCleared;
 		} finally {
 			restore();
 		}
@@ -382,27 +450,19 @@ test("an inactive automatic recap does not retry its completed empty response", 
 	assertNoRecapSideEffects(harness);
 });
 
-test("thrown auth and completion failures do not retry and use the normal TUI error path", async (t) => {
-	await t.test("authentication rejection makes no completion request", async () => {
-		const failure = new Error("auth failure");
+test("thrown completion failures do not retry and use the normal TUI error path", async (t) => {
+	await t.test("host completion rejection makes one request", async () => {
+		const failure = new Error("host completion failure");
 		const harness = createHarness({
-			getAuth: async () => {
+			complete: async () => {
 				throw failure;
 			},
 		});
-		let calls = 0;
-		const restore = setRecapCompletionForTesting(async () => {
-			calls++;
-			return completionResponse([]);
-		});
-		try {
-			await harness.invokeRecap();
-		} finally {
-			restore();
-		}
-		assert.equal(calls, 0);
+		await harness.invokeRecap();
+		assert.equal(harness.hostCompletionCalls.length, 1);
 		assert.deepEqual(harness.entries, []);
-		assert.match(harness.widgetText(), /auth failure/);
+		assert.deepEqual(harness.titles, []);
+		assert.match(harness.widgetText(), /host completion failure/);
 		assert.doesNotMatch(harness.widgetText(), /empty output/);
 	});
 

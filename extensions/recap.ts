@@ -13,19 +13,35 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, open, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { complete } from "@earendil-works/pi-ai/compat";
+import type { complete } from "@earendil-works/pi-ai/compat";
 
 type RecapCompletion = typeof complete;
 
-let recapCompletion: RecapCompletion = complete;
+let recapCompletionForTesting: RecapCompletion | undefined;
 
 /** Test seam for deterministic recap completion responses. */
-export function setRecapCompletionForTesting(override: RecapCompletion): () => void {
-	const previous = recapCompletion;
-	recapCompletion = override;
+export function setRecapCompletionForTesting(
+	override: RecapCompletion,
+): () => void {
+	const previous = recapCompletionForTesting;
+	recapCompletionForTesting = override;
 	return () => {
-		if (recapCompletion === override) recapCompletion = previous;
+		if (recapCompletionForTesting === override) {
+			recapCompletionForTesting = previous;
+		}
 	};
+}
+
+function completeRecap(
+	ctx: ExtensionContext,
+	model: NonNullable<ExtensionContext["model"]>,
+	context: Parameters<RecapCompletion>[1],
+	options: Parameters<RecapCompletion>[2],
+): ReturnType<RecapCompletion> {
+	if (recapCompletionForTesting) {
+		return recapCompletionForTesting(model, context, options);
+	}
+	return ctx.modelRegistry.complete(model, context, options);
 }
 import {
 	CONFIG_DIR_NAME,
@@ -719,20 +735,6 @@ async function runRecap(
 	if (showProgress) showRecapProgress(ctx, config);
 
 	try {
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (!isCurrentRecapRun(state, run)) return undefined;
-		if (!auth.ok) {
-			const message = "error" in auth ? auth.error : `Failed to resolve API key for ${model.provider}`;
-			displayRecapError(ctx, config, message);
-			displayed = true;
-			return undefined;
-		}
-		if (!auth.apiKey) {
-			displayRecapError(ctx, config, `No API key for ${model.provider}`);
-			displayed = true;
-			return undefined;
-		}
-
 		const completionContext = {
 			systemPrompt: buildSystemPrompt(config),
 			messages: [
@@ -744,9 +746,6 @@ async function runRecap(
 			],
 		};
 		const completionOptions = {
-			apiKey: auth.apiKey,
-			headers: auth.headers,
-			env: auth.env,
 			maxTokens: config.recap.maxTokens,
 			signal: runSignal,
 		};
@@ -755,8 +754,17 @@ async function runRecap(
 
 		for (let attempt = 0; attempt < 2; attempt++) {
 			if (!isCurrentRecapRun(state, run)) return undefined;
-			const response = await recapCompletion(model, completionContext, completionOptions);
+			const response = await completeRecap(ctx, model, completionContext, completionOptions);
 			if (!isCurrentRecapRun(state, run) || response.stopReason === "aborted") return undefined;
+			if (response.stopReason === "error") {
+				displayRecapError(
+					ctx,
+					config,
+					`Recap model request failed (${safeRecapModelName(model)}; reason=error)`,
+				);
+				displayed = true;
+				return undefined;
+			}
 
 			const details = inspectRecapResponse(response);
 			if (details.raw) {
