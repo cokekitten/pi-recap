@@ -1,5 +1,14 @@
 # Changelog
 
+## Fork — recap 请求体透传 `recap.extraBody` (2026-09-30)
+
+fork 自有配置项（上游没有），用于把 provider 特有字段带进 recap 的请求体：
+
+- `recap.extraBody`（对象）→ 作为 pi 的 `StreamOptions.samplingParams` 下发；pi 在自身具名字段之后合并，所以这里的键会覆盖。典型用法 `{"thinking":{"type":"disabled"}}` 关掉 MiniMax M3 这类默认强制思考模型的思考链：思考 token 与 recap 输出共用 300 token 预算，实测 ~10k 字符上下文下 5 次里 2–3 次被截断成失败，关掉后 5/5 成功、耗时 2.5–3.5s → 1.0–1.5s、输出 ~300 → ~60 token。
+- 抽出 `recapCompleteOptions()` 统一构造 recap 的 completion options（原来在调用点内联），便于测试；未配置 `extraBody` 时不带 `samplingParams`，行为与上游一致。
+- 新增 `tests/recap-extra-body.test.ts`（4 项）：`normalizeConfig` 保留非空对象、丢弃空对象/非对象；`recapCompleteOptions` 透传与省略；`runRecap` 真的把 `extraBody` 放到 completion options 上。全量 81 项通过。
+- 只在 recap 调用里生效：不要把它写到 models.json 的 model/provider 级别，那会连带关掉交互使用同一模型时的思考。
+
 ## Fork — rebased onto upstream 0.4.3 (2026-09-30)
 
 本地 fork 改动重新落到上游 0.4.3 基线上（`extensions/`、`tests/`、`examples/`、README、CHANGELOG 全部取自 `zhcsyncer/pi-extensions@f48a91b`），此前基于 0.4.0 的 4 处展示层改动手工重打：

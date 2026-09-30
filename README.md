@@ -4,14 +4,15 @@
 
 **Repo:** https://github.com/cokekitten/pi-recap
 
-> **About this repo** — standalone fork of [`@zhcsyncer/pi-recap`](https://github.com/zhcsyncer/pi-extensions/tree/main/packages/pi-recap) (the `pi-recap` package in the `zhcsyncer/pi-extensions` monorepo), kept in sync with upstream **0.4.3**. Only the recap display layer is changed; behavior, config, and model calls are upstream's:
+> **About this repo** — standalone fork of [`@zhcsyncer/pi-recap`](https://github.com/zhcsyncer/pi-extensions/tree/main/packages/pi-recap) (the `pi-recap` package in the `zhcsyncer/pi-extensions` monorepo), kept in sync with upstream **0.4.3**. Changes are the recap display layer plus one config escape hatch (`recap.extraBody`); everything else — behavior, config shape, and model calls — stays upstream's:
 >
 > - **Single-line recap widget**: success rendering is one compact line — `※ recap  {time} {recap}` — instead of the multi-line block (title + body + `Generated {time}`).
 > - **Prefix restyle**: `RECAP  ` → `※ recap  ` (with the ※ marker) across the generating / failed / success states; the fallback-title warning renders as `⚠ {warning}` instead of `WARNING  {warning}`.
 > - **Title dropped from the widget**: the `data.title ?? "Recent activity"` heading is not rendered. The title is still generated and still drives session-name and multiplexer sync.
 > - **RPC modes show recap too**: in non-TUI modes (`pi-web` and other RPC clients) a factory-shaped widget is invisible, so progress, results, and errors are delivered as plain string lines instead of being skipped.
+> - **`recap.extraBody` request passthrough** (fork-only config key): raw JSON fields forwarded to the recap completion as pi's `StreamOptions.samplingParams`, which pi merges into the request body after its own named fields. Used to switch off provider-side thinking that pi does not model, so it cannot eat the recap output budget (see "Turn off provider thinking").
 >
-> These four behaviors are pinned by `tests/fork-display.test.ts`; after rebasing onto a newer upstream, run that file first. Upstream updates therefore drop in as: copy `extensions/` + `tests/` + `examples/` + `README*` + `CHANGELOG.md`, re-apply this patch, then `npm test`.
+> The first four behaviors are pinned by `tests/fork-display.test.ts`, the fifth by `tests/recap-extra-body.test.ts`; after rebasing onto a newer upstream, run those two files first. Upstream updates therefore drop in as: copy `extensions/` + `tests/` + `examples/` + `README*` + `CHANGELOG.md`, re-apply these patches, then `npm test`.
 
 `pi-recap` is a Pi extension that generates a **recent activity recap**. It is not compaction and does not replace or shrink the LLM context.
 
@@ -169,6 +170,23 @@ Use a specific recap model in `/recap-config`, or in JSON:
 ```
 
 Recap display always uses an editor widget above the editor. Automatic recap progress is replaced by the result in that widget. Manual `/recap` uses a cancellable loader while generating, then shows the result in the widget. The widget is cleared when the next message starts. If an automatic recap is still running, it is cancelled and cannot later store or redisplay a stale result.
+
+#### Turn off provider thinking that Pi does not model
+
+Some models think by default on the server side even when the request carries no reasoning instruction — recap never sends one, so `/think` does not affect it. Reasoning tokens are billed against the recap output budget (`maxTokens`), so a thinking model can spend the whole budget on reasoning, truncate the JSON, and make every other recap fail with `Recap model output was truncated by the token limit`.
+
+`recap.extraBody` merges raw fields into the recap request body (forwarded as pi's `StreamOptions.samplingParams`, applied after pi's own fields, so these keys win). Providers that do not understand the fields ignore them:
+
+```json
+{
+  "recap": {
+    "model": "your-provider/minimax-m3",
+    "extraBody": { "thinking": { "type": "disabled" } }
+  }
+}
+```
+
+Measured on MiniMax M3 behind an OpenAI-compatible gateway, recapping ~10k chars of recent activity at the 300-token recap budget: with thinking on (no `extraBody`) 2–3 of 5 recaps failed as truncated and each took ~2.5–3.5s; with `{"thinking":{"type":"disabled"}}` all 5 succeeded in ~1.0–1.5s and produced ~60 output tokens instead of ~300. Only request-level keys belong here: a model-level or provider-level override would also strip thinking from your interactive use of the same model. Models that require thinking (MiniMax rejects `thinking.type="disabled"` with "requires adaptive thinking") cannot be used this way — pick another model or raise `RECAP_MAX_TOKENS` in the source instead. `extraBody` is not in `/recap-config`; edit the JSON, or use `/recap-config json`.
 
 When an older config is loaded, removed fields such as `enabled`, `manualCommand`, `title.generate`, `title.applyToSessionName`, and `display` are dropped and the source config file is updated. A previous `enabled: false` becomes `auto: false`. `applyToSessionName: false` or `applyPolicy: "never"` becomes `applyPolicy: "off"`; other session-name policies are kept. Legacy `tmux` settings are migrated to `multiplexer`; when both exist, explicitly configured `multiplexer` fields take precedence.
 

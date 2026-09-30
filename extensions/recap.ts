@@ -67,6 +67,13 @@ export type RecapConfig = {
 		model: "current" | string;
 		fallbackToCurrentModel: boolean;
 		language: string;
+		/**
+		 * Raw fields merged into the recap request body (forwarded as pi's
+		 * `StreamOptions.samplingParams`, which pi applies last, so these keys win).
+		 * Used for provider switches pi does not model, e.g. turning thinking off on
+		 * MiniMax M3: `{ "thinking": { "type": "disabled" } }`.
+		 */
+		extraBody?: Record<string, unknown>;
 	};
 	title: {
 		applyPolicy: TitleApplyPolicy;
@@ -135,7 +142,7 @@ type ConfigMigration = {
 };
 
 const CONFIG_FIELDS: Record<string, ReadonlySet<string>> = {
-	recap: new Set(["auto", "idleAfterTurnMs", "model", "fallbackToCurrentModel", "language"]),
+	recap: new Set(["auto", "idleAfterTurnMs", "model", "fallbackToCurrentModel", "language", "extraBody"]),
 	title: new Set(["applyPolicy"]),
 	multiplexer: new Set(["enabled", "template"]),
 };
@@ -397,6 +404,9 @@ export function normalizeConfig(config: RecapConfig): RecapConfig {
 			language: typeof recapIn.language === "string" && recapIn.language
 				? recapIn.language
 				: DEFAULT_CONFIG.recap.language,
+			...(isRecord(recapIn.extraBody) && Object.keys(recapIn.extraBody).length > 0
+				? { extraBody: { ...recapIn.extraBody } }
+				: {}),
 		},
 		title: {
 			applyPolicy: normalizeTitleApplyPolicy(config.title),
@@ -665,6 +675,31 @@ function getOpenCodeSessionHeaders(
 	return { "x-opencode-session": sessionId, "x-opencode-client": "pi" };
 }
 
+export type RecapCompleteOptions = NonNullable<Parameters<typeof complete>[2]>;
+
+/**
+ * Build the options for the recap completion call. `recap.extraBody` is forwarded as pi's
+ * `samplingParams`: pi merges it into the request body after its own named fields, so a key
+ * here overrides them, and providers that do not model it simply ignore it.
+ */
+export function recapCompleteOptions(
+	config: RecapConfig,
+	params: {
+		maxTokens: number;
+		signal?: AbortSignal;
+		sessionId?: string;
+		headers?: Record<string, string>;
+	},
+): RecapCompleteOptions {
+	return {
+		maxTokens: params.maxTokens,
+		signal: params.signal,
+		sessionId: params.sessionId,
+		...(params.headers ? { headers: params.headers } : {}),
+		...(config.recap.extraBody ? { samplingParams: { ...config.recap.extraBody } } : {}),
+	} as RecapCompleteOptions;
+}
+
 function resolveCompleteModel(ctx: ExtensionContext, completeModel: typeof complete | undefined): typeof complete {
 	if (completeModel) return completeModel;
 	if (typeof ctx.modelRegistry.complete === "function") {
@@ -747,12 +782,12 @@ export async function runRecap(
 						},
 					],
 				},
-				{
+				recapCompleteOptions(config, {
 					maxTokens: RECAP_MAX_TOKENS,
 					signal: runSignal,
 					sessionId,
-					...(headers ? { headers } : {}),
-				},
+					headers,
+				}),
 			);
 		} catch (error) {
 			if (runSignal?.aborted || state.activeRun !== run) return undefined;
