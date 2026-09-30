@@ -1,5 +1,16 @@
 # Changelog
 
+## Fork — recap 失败自动重试一次 (2026-10-01)
+
+上游渠道偶发返回 **HTTP 200 + 空 completion**（SSE 里 `choices: []` + usage，没有 finish_reason），pi 的 openai-completions 会把它 resolve 成 `stopReason:"error"`（不是 reject），widget 直接显示 `Failed / Recap model failed: Stream ended without finish_reason`。这一层原本没有任何兜底：pi 的 `modelRegistry.complete` 就是 `stream(...).result()`，不注入 retry（`settings.retry` 只作用于交互轮次与压缩），网关侧 `RetryTimes=0` 也不跳渠道重试；而“200 + 无错误”在网关看来是成功，永远不触发渠道自动禁用。
+
+- `runRecap` 的 completion 调用改为最多 `RECAP_ATTEMPTS = 2` 次：任一次拿到可用 recap 即停；两次都不行才报错，且只报一次（错误取最后一次的真实原因）。
+- **不重试**的情况：`stopReason === "aborted"`、run 被更新的一次取代、signal 已 abort —— 一律立刻退出，不再多发一个请求，也不报错。
+- throw 出来的错误（网络层等）同样重试一次，并且**保留原始 message**：没有 response 时不再拿空输出走一遍 `resolveRecapOutput`，否则 “socket hang up” 会被改写成 “Recap model returned empty output”。
+- 重试期间进度条显示 `※ recap  Generating... retry 1/1`（`showRecapProgress` 增加可选 `attempt` 参数，默认 1 时与上游行为一致）。
+- 新增 `tests/recap-retry.test.ts`（6 项）：瞬时 error 后第二次成功则存盘、两次都失败只报一次错且写 0 条目、aborted / 被取代 / 首次成功都不发第二个请求、throw 的错误文案不被改写。把 `RECAP_ATTEMPTS` 改回 1 可让其中 3 项变红（测试是承重的）。全量 87 项通过，typecheck 干净。
+- 端到端复核：假上游第一次返回与故障渠道同形状的空 completion、第二次返回合法 JSON，跑真实 `runRecap` + 真实 pi `complete()` ⇒ 调用 2 次、recap 存下来、不显示 Failed；把假上游改成恒失败 ⇒ 调用 2 次、写 0 条目、Failed 只出现一次。
+
 ## Fork — recap 请求体透传 `recap.extraBody` (2026-09-30)
 
 fork 自有配置项（上游没有），用于把 provider 特有字段带进 recap 的请求体：

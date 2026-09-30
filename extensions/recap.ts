@@ -34,6 +34,7 @@ import {
 	recapOutputWarning,
 	resolveRecapOutput,
 	type RecapTitleSource,
+	type ResolvedRecapOutput,
 } from "./recap-output.ts";
 import {
 	migrateMultiplexerConfig,
@@ -53,6 +54,9 @@ export type TitleApplyPolicy = "off" | "if-empty" | "if-empty-or-auto" | "always
 const MIN_SESSION_TURNS = 3;
 const RECAP_MAX_RECENT_CHARS = 20_000;
 const RECAP_MAX_TOKENS = 300;
+// 上游渠道偶发返回 HTTP 200 + 空 completion（没有 finish_reason），pi 会把它 resolve 成
+// stopReason:"error"（不是 reject）。这类故障是瞬时的，所以一次失败先重试一次再决定报错。
+const RECAP_ATTEMPTS = 2;
 export const RECAP_MAX_LENGTH = 240;
 const TITLE_MAX_LENGTH = 50;
 const MULTIPLEXER_MAX_LENGTH = 48;
@@ -768,51 +772,65 @@ export async function runRecap(
 	try {
 		const sessionId = readSessionId(ctx);
 		const headers = getOpenCodeSessionHeaders(model, sessionId);
-		let response;
-		try {
-			response = await completeModel(
-				model,
-				{
-					systemPrompt: buildSystemPrompt(config),
-					messages: [
-						{
-							role: "user" as const,
-							content: [{ type: "text" as const, text: source.conversation }],
-							timestamp: Date.now(),
-						},
-					],
-				},
-				recapCompleteOptions(config, {
-					maxTokens: RECAP_MAX_TOKENS,
-					signal: runSignal,
-					sessionId,
-					headers,
-				}),
-			);
-		} catch (error) {
-			if (runSignal?.aborted || state.activeRun !== run) return undefined;
-			displayRecapError(ctx, config, error instanceof Error ? error.message : String(error));
-			displayed = true;
-			return undefined;
+		let resolved: Extract<ResolvedRecapOutput, { ok: true }> | undefined;
+		let lastError: string | undefined;
+
+		// 失败先重试（见 RECAP_ATTEMPTS）；aborted 或被更新的 run 取代时立刻退出、不重试、不报错。
+		for (let attempt = 1; attempt <= RECAP_ATTEMPTS && !resolved; attempt++) {
+			if (attempt > 1) showRecapProgress(ctx, config, attempt);
+			let response: Awaited<ReturnType<typeof complete>> | undefined;
+			try {
+				response = await completeModel(
+					model,
+					{
+						systemPrompt: buildSystemPrompt(config),
+						messages: [
+							{
+								role: "user" as const,
+								content: [{ type: "text" as const, text: source.conversation }],
+								timestamp: Date.now(),
+							},
+						],
+					},
+					recapCompleteOptions(config, {
+						maxTokens: RECAP_MAX_TOKENS,
+						signal: runSignal,
+						sessionId,
+						headers,
+					}),
+				);
+			} catch (error) {
+				if (runSignal?.aborted || state.activeRun !== run) return undefined;
+				lastError = error instanceof Error ? error.message : String(error);
+			}
+
+			if (!isCurrentRecapRun(state, run)) return undefined;
+			if (response?.stopReason === "aborted") return undefined;
+
+			// response 为空 == 上面 throw 过，lastError 里已经是真实原因，不要用空输出覆盖它
+			if (response) {
+				const raw = response.content
+					.filter((item): item is { type: "text"; text: string } => item.type === "text")
+					.map((item) => item.text)
+					.join("\n")
+					.trim();
+				const attemptResolved = resolveRecapOutput(raw, {
+					stopReason: response.stopReason,
+					errorMessage: response.errorMessage,
+					generateTitle: true,
+					titleMaxLength: TITLE_MAX_LENGTH,
+					recapMaxLength: RECAP_MAX_LENGTH,
+				});
+				if (attemptResolved.ok) resolved = attemptResolved;
+				else lastError = attemptResolved.error;
+			}
 		}
 
-		if (!isCurrentRecapRun(state, run) || response.stopReason === "aborted") return undefined;
-
-		const raw = response.content
-			.filter((item): item is { type: "text"; text: string } => item.type === "text")
-			.map((item) => item.text)
-			.join("\n")
-			.trim();
-		const resolved = resolveRecapOutput(raw, {
-			stopReason: response.stopReason,
-			errorMessage: response.errorMessage,
-			generateTitle: true,
-			titleMaxLength: TITLE_MAX_LENGTH,
-			recapMaxLength: RECAP_MAX_LENGTH,
-		});
-		if (!resolved.ok) {
-			displayRecapError(ctx, config, resolved.error);
-			displayed = true;
+		if (!resolved) {
+			if (lastError) {
+				displayRecapError(ctx, config, lastError);
+				displayed = true;
+			}
 			return undefined;
 		}
 
@@ -872,9 +890,10 @@ function clearRecapDisplay(ctx: ExtensionContext) {
 	ctx.ui.setWidget(WIDGET_KEY, undefined);
 }
 
-export function showRecapProgress(ctx: ExtensionContext, config: RecapConfig) {
+export function showRecapProgress(ctx: ExtensionContext, config: RecapConfig, attempt = 1) {
 	clearRecapDisplay(ctx);
-	ctx.ui.setWidget(WIDGET_KEY, [`${WIDGET_PREFIX}Generating...`], { placement: WIDGET_PLACEMENT });
+	const retry = attempt > 1 ? ` retry ${attempt - 1}/${RECAP_ATTEMPTS - 1}` : "";
+	ctx.ui.setWidget(WIDGET_KEY, [`${WIDGET_PREFIX}Generating...${retry}`], { placement: WIDGET_PLACEMENT });
 }
 
 export function displayRecapError(ctx: ExtensionContext, config: RecapConfig, message: string) {
