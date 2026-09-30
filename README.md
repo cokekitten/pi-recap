@@ -4,11 +4,14 @@
 
 **Repo:** https://github.com/cokekitten/pi-recap
 
-> **About this repo** — standalone repo derived from [`@zhcsyncer/pi-recap`](https://github.com/zhcsyncer/pi-extensions/tree/main/packages/pi-recap) (the `pi-recap` package in the `zhcsyncer/pi-extensions` monorepo). Maintained independently; changes are cosmetic only (compact UI), no behavior/logic changes:
+> **About this repo** — standalone fork of [`@zhcsyncer/pi-recap`](https://github.com/zhcsyncer/pi-extensions/tree/main/packages/pi-recap) (the `pi-recap` package in the `zhcsyncer/pi-extensions` monorepo), kept in sync with upstream **0.4.3**. Only the recap display layer is changed; behavior, config, and model calls are upstream's:
 >
-> - **Single-line recap widget**: success rendering changed from a multi-line block (title + body + generated-time) to a single line — `※ recap {time} {body}`.
-> - **Prefix restyle**: `RECAP  ` → `※ recap  ` (with the ※ marker) across the generating / failed / success states.
-> - **Title dropped**: the `data.title ?? "Recent activity"` heading is no longer rendered.
+> - **Single-line recap widget**: success rendering is one compact line — `※ recap  {time} {recap}` — instead of the multi-line block (title + body + `Generated {time}`).
+> - **Prefix restyle**: `RECAP  ` → `※ recap  ` (with the ※ marker) across the generating / failed / success states; the fallback-title warning renders as `⚠ {warning}` instead of `WARNING  {warning}`.
+> - **Title dropped from the widget**: the `data.title ?? "Recent activity"` heading is not rendered. The title is still generated and still drives session-name and multiplexer sync.
+> - **RPC modes show recap too**: in non-TUI modes (`pi-web` and other RPC clients) a factory-shaped widget is invisible, so progress, results, and errors are delivered as plain string lines instead of being skipped.
+>
+> These four behaviors are pinned by `tests/fork-display.test.ts`; after rebasing onto a newer upstream, run that file first. Upstream updates therefore drop in as: copy `extensions/` + `tests/` + `examples/` + `README*` + `CHANGELOG.md`, re-apply this patch, then `npm test`.
 
 `pi-recap` is a Pi extension that generates a **recent activity recap**. It is not compaction and does not replace or shrink the LLM context.
 
@@ -17,16 +20,17 @@ Features:
 - Generate a recent activity recap with `/recap`.
 - Automatically recap after the agent has been idle for a while.
 - Cancel an unfinished automatic recap when a new message arrives, preventing stale results from being stored or displayed.
-- Display automatic recap progress plus recap results and errors in an editor widget, without duplicating successful results in chat notifications.
-- Generate a short title as a recap side effect.
-- Optionally apply the title to the Pi session name.
+- Display automatic recap progress plus recap results and errors in an editor widget, without duplicating successful results in chat notifications. Generated time uses a 24-hour local clock.
+- Generate a short title as a recap side effect, with a deterministic recap-derived fallback and visible warning when the model omits a usable title.
+- Reject empty, truncated, failed, malformed JSON-like, or overly long unstructured model output without saving partial recap state.
+- Optionally apply the title to the Pi session name with `title.applyPolicy`: `off`, `if-empty`, `if-empty-or-auto`, or `always`. `off` leaves the name alone.
 - Optionally sync Pi session name changes to the nearest terminal multiplexer: a Herdr pane label or tmux window name.
-- Configure common options with `/recap-config`.
-- Edit full JSON config with `/recap-config json`.
+- `/recap` is always available. `/recap-config` only keeps auto recap, idle wait, model, language, session-name policy, plus multiplexer enablement and template.
+- `/recap-config json` remains available as an escape hatch, but is not required for normal use.
 
 ### Installation
 
-From GitHub:
+From this fork on GitHub:
 
 ```bash
 pi install git:github.com/cokekitten/pi-recap
@@ -38,10 +42,9 @@ Or try it for one run without installing:
 pi -e git:github.com/cokekitten/pi-recap
 ```
 
-Local checkout:
+From a local checkout (e.g. in `~/.pi/agent/settings.json` → `packages`):
 
 ```bash
-# e.g. in ~/.pi/agent/settings.json packages:
 #   "../../dev/pi-expansion/pi-recap"
 pi install /path/to/pi-recap
 # or
@@ -49,6 +52,8 @@ pi -e /path/to/pi-recap
 ```
 
 After installing, restart pi or run `/reload`.
+
+Upstream alternatives (`@zhcsyncer/pi-recap`, whole-bundle install) still work; they just do not include this fork's display layer.
 
 ### Commands
 
@@ -70,17 +75,19 @@ Generate a recent activity recap. It will:
 /recap-config
 ```
 
-Open the TUI config screen and save common settings to:
+Open the TUI config screen. `/recap` is always available; auto recap is the background switch. It saves to:
 
 ```text
 $PI_CODING_AGENT_DIR/extension-data/pi-recap/config.json
 ```
 
+The model list starts with `current` (the session model), then currently enabled models. A configured model that is not in that list still shows, and opening the picker does not change it. While the model is `current`, fallback is hidden and left unchanged. If you pick a specific model that later cannot be resolved and fallback is on, recap warns once and uses the session model. A cheaper dedicated recap model is recommended.
+
 ```text
 /recap-config json
 ```
 
-Edit the full JSON config.
+Edit the JSON config. This is optional; the TUI covers the remaining settings, including a custom idle wait and language.
 
 ### TUI only
 
@@ -108,32 +115,18 @@ Default config:
 ```json
 {
   "recap": {
-    "enabled": true,
     "auto": true,
-    "manualCommand": true,
     "idleAfterTurnMs": 180000,
-    "minSessionTurns": 3,
-    "neverTwiceInARow": true,
     "model": "current",
     "fallbackToCurrentModel": true,
-    "maxRecentChars": 20000,
-    "maxTokens": 300,
     "language": "auto"
   },
-  "display": {
-    "widgetPlacement": "aboveEditor"
-  },
   "title": {
-    "generate": true,
-    "applyToSessionName": false,
-    "applyPolicy": "if-empty-or-auto",
-    "maxLength": 50
+    "applyPolicy": "off"
   },
   "multiplexer": {
     "enabled": true,
-    "template": "π {session} · {project}",
-    "maxLength": 48,
-    "restoreOnShutdown": true
+    "template": "π {session} · {project}"
   }
 }
 ```
@@ -145,11 +138,14 @@ Apply generated titles to Pi session names:
 ```json
 {
   "title": {
-    "applyToSessionName": true,
     "applyPolicy": "if-empty-or-auto"
   }
 }
 ```
+
+Titles are always generated. If the model omits a usable title, recap deterministically uses the cleaned one-line recap as the title. `off` does not change the Pi session name. `if-empty` fills a blank name only. `if-empty-or-auto` also updates a name recap last wrote, without overwriting a later manual name. `always` overwrites. The persisted recap records that the title came from the fallback, so the editor widget shows the warning after generation and after a session reload.
+
+Short plain-text and ordinary bullet recap responses remain valid. Empty recaps, malformed or truncated JSON-like responses, overly long unstructured dumps, and completions stopped with `length` or `error` are treated as failed recaps: the widget shows the failure, no recap entry is appended, the session is not renamed, and the previous recap source position is preserved.
 
 Disable automatic recap and keep manual `/recap` only:
 
@@ -161,7 +157,7 @@ Disable automatic recap and keep manual `/recap` only:
 }
 ```
 
-Use a specific recap model:
+Use a specific recap model in `/recap-config`, or in JSON:
 
 ```json
 {
@@ -172,27 +168,16 @@ Use a specific recap model:
 }
 ```
 
-Choose widget placement:
+Recap display always uses an editor widget above the editor. Automatic recap progress is replaced by the result in that widget. Manual `/recap` uses a cancellable loader while generating, then shows the result in the widget. The widget is cleared when the next message starts. If an automatic recap is still running, it is cancelled and cannot later store or redisplay a stale result.
 
-```json
-{
-  "display": {
-    "widgetPlacement": "aboveEditor"
-  }
-}
-```
-
-Recap display always uses an editor widget; the display surface is not configurable. Automatic recap progress is replaced by the result in that widget. Manual `/recap` uses a cancellable loader while generating, then shows the result in the widget. The widget is cleared when the next message starts. If an automatic recap is still running, it is cancelled and cannot later store or redisplay a stale result.
-
-When an older config is loaded, obsolete `display.notify`, `display.mode`, `display.widget`, and `display.clearWidgetOnNextAgentStart` fields are removed and the source config file is updated. `display.widgetPlacement` is preserved. Legacy `tmux` settings are migrated to `multiplexer`; when both exist, explicitly configured `multiplexer` fields take precedence.
+When an older config is loaded, removed fields such as `enabled`, `manualCommand`, `title.generate`, `title.applyToSessionName`, and `display` are dropped and the source config file is updated. A previous `enabled: false` becomes `auto: false`. `applyToSessionName: false` or `applyPolicy: "never"` becomes `applyPolicy: "off"`; other session-name policies are kept. Legacy `tmux` settings are migrated to `multiplexer`; when both exist, explicitly configured `multiplexer` fields take precedence.
 
 Customize the Herdr pane label or tmux window name:
 
 ```json
 {
   "multiplexer": {
-    "template": "π {project} · {session}",
-    "maxLength": 60
+    "template": "π {project} · {session}"
   }
 }
 ```
@@ -250,7 +235,7 @@ When `multiplexer.enabled` is true, recap automatically selects the directly hos
 
 In nested Herdr-inside-tmux sessions, recap only updates the Herdr pane. If Herdr is detected but its pane identity is incomplete or its CLI is unavailable, recap warns once and does not fall back to the inherited tmux layer.
 
-For tmux, recap keeps the original behavior of disabling `automatic-rename` while it owns the window name. The original pane/window name is restored only if the current name still equals recap's last successful write, so a later manual rename is preserved. Disabling sync or reloading the extension releases ownership immediately; reload always restores before the new extension instance reapplies the name. On ordinary Pi exit, `restoreOnShutdown` controls restoration. tmux's captured `automatic-rename` setting is restored whenever owned sync is restored or disabled.
+For tmux, recap keeps the original behavior of disabling `automatic-rename` while it owns the window name. The original pane/window name is restored only if the current name still equals recap's last successful write, so a later manual rename is preserved. Disabling sync or reloading the extension releases ownership immediately; reload always restores before the new extension instance reapplies the name. Ordinary Pi exit also restores the previous name. tmux's captured `automatic-rename` setting is restored whenever owned sync is restored or disabled.
 
 All of these trigger multiplexer sync:
 
@@ -268,6 +253,7 @@ and recap calling `pi.setSessionName(title)` when enabled by config. Recap does 
 
 - Recap makes an extra model call.
 - By default it uses the current Pi model: `recap.model = "current"`.
+- A cheaper dedicated recap model is recommended if you do not want to spend the session model on this side call.
 - Recent activity is sent to the current or configured provider.
 - Disable automatic recap if you do not want extra background model calls:
 
@@ -331,7 +317,3 @@ or MP4 video:
   }
 }
 ```
-
-## License
-
-MIT
