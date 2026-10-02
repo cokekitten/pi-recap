@@ -57,6 +57,8 @@ const RECAP_MAX_TOKENS = 300;
 // 上游渠道偶发返回 HTTP 200 + 空 completion（没有 finish_reason），pi 会把它 resolve 成
 // stopReason:"error"（不是 reject）。这类故障是瞬时的，所以一次失败先重试一次再决定报错。
 const RECAP_ATTEMPTS = 2;
+// 重试间隔："集群负载较高"这类瞬时过载里立即重试大概率连续撞墙，退避几秒再试。
+const RECAP_RETRY_DELAY_MS = 8_000;
 export const RECAP_MAX_LENGTH = 240;
 const TITLE_MAX_LENGTH = 50;
 const MULTIPLEXER_MAX_LENGTH = 48;
@@ -78,6 +80,18 @@ export type RecapConfig = {
 		 * MiniMax M3: `{ "thinking": { "type": "disabled" } }`.
 		 */
 		extraBody?: Record<string, unknown>;
+		/**
+		 * Runtime failover target ("provider/id" or "current"). After the recap
+		 * model fails all its attempts, one more attempt is made with this model.
+		 * Empty disables the failover.
+		 */
+		fallbackModel: string;
+		/**
+		 * Like `extraBody`, but applied to the fallback-model attempt only (the two
+		 * models usually need different provider switches, e.g. turning thinking
+		 * off on both, via the field each understands).
+		 */
+		fallbackExtraBody?: Record<string, unknown>;
 	};
 	title: {
 		applyPolicy: TitleApplyPolicy;
@@ -109,6 +123,7 @@ export const DEFAULT_CONFIG: RecapConfig = {
 		idleAfterTurnMs: 3 * 60_000,
 		model: "current",
 		fallbackToCurrentModel: true,
+		fallbackModel: "",
 		language: "auto",
 	},
 	title: {
@@ -146,7 +161,7 @@ type ConfigMigration = {
 };
 
 const CONFIG_FIELDS: Record<string, ReadonlySet<string>> = {
-	recap: new Set(["auto", "idleAfterTurnMs", "model", "fallbackToCurrentModel", "language", "extraBody"]),
+	recap: new Set(["auto", "idleAfterTurnMs", "model", "fallbackToCurrentModel", "fallbackModel", "fallbackExtraBody", "language", "extraBody"]),
 	title: new Set(["applyPolicy"]),
 	multiplexer: new Set(["enabled", "template"]),
 };
@@ -405,11 +420,15 @@ export function normalizeConfig(config: RecapConfig): RecapConfig {
 			fallbackToCurrentModel: typeof recapIn.fallbackToCurrentModel === "boolean"
 				? recapIn.fallbackToCurrentModel
 				: DEFAULT_CONFIG.recap.fallbackToCurrentModel,
+			fallbackModel: typeof recapIn.fallbackModel === "string" ? recapIn.fallbackModel.trim() : "",
 			language: typeof recapIn.language === "string" && recapIn.language
 				? recapIn.language
 				: DEFAULT_CONFIG.recap.language,
 			...(isRecord(recapIn.extraBody) && Object.keys(recapIn.extraBody).length > 0
 				? { extraBody: { ...recapIn.extraBody } }
+				: {}),
+			...(isRecord(recapIn.fallbackExtraBody) && Object.keys(recapIn.fallbackExtraBody).length > 0
+				? { fallbackExtraBody: { ...recapIn.fallbackExtraBody } }
 				: {}),
 		},
 		title: {
@@ -591,16 +610,17 @@ export function formatGeneratedTime(generatedAt: number, locales?: Intl.LocalesA
 	}).format(generatedAt);
 }
 
+function resolveModelReference(ctx: ExtensionContext, reference: string) {
+	const separator = reference.indexOf("/");
+	if (separator <= 0) return undefined;
+	return ctx.modelRegistry.find(reference.slice(0, separator), reference.slice(separator + 1));
+}
+
 export function resolveRecapModel(ctx: ExtensionContext, config: RecapConfig) {
 	if (config.recap.model === "current") return ctx.model;
 
-	const separator = config.recap.model.indexOf("/");
-	if (separator > 0) {
-		const provider = config.recap.model.slice(0, separator);
-		const modelId = config.recap.model.slice(separator + 1);
-		const model = ctx.modelRegistry.find(provider, modelId);
-		if (model) return model;
-	}
+	const model = resolveModelReference(ctx, config.recap.model);
+	if (model) return model;
 
 	if (!config.recap.fallbackToCurrentModel || !ctx.model) return undefined;
 	ctx.ui.notify(
@@ -608,6 +628,30 @@ export function resolveRecapModel(ctx: ExtensionContext, config: RecapConfig) {
 		"warning",
 	);
 	return ctx.model;
+}
+
+/**
+ * Runtime failover target: `recap.fallbackModel` resolved against the registry.
+ * Returns undefined when not configured, unavailable (warns once), or identical
+ * to the primary model (retrying the same model again would be pointless).
+ */
+export function resolveRuntimeFallbackModel(
+	ctx: ExtensionContext,
+	config: RecapConfig,
+	primary: { provider?: string; id?: string } | undefined,
+) {
+	const reference = config.recap.fallbackModel.trim();
+	if (!reference) return undefined;
+	const model = reference === "current" ? ctx.model : resolveModelReference(ctx, reference);
+	if (!model) {
+		ctx.ui.notify(
+			`Recap fallback model ${reference} is unavailable; continuing without fallback.`,
+			"warning",
+		);
+		return undefined;
+	}
+	if (primary && model.provider === primary.provider && model.id === primary.id) return undefined;
+	return model;
 }
 
 export type TitleApplicationInput = {
@@ -694,13 +738,14 @@ export function recapCompleteOptions(
 		sessionId?: string;
 		headers?: Record<string, string>;
 	},
+	extraBody: Record<string, unknown> | undefined = config.recap.extraBody,
 ): RecapCompleteOptions {
 	return {
 		maxTokens: params.maxTokens,
 		signal: params.signal,
 		sessionId: params.sessionId,
 		...(params.headers ? { headers: params.headers } : {}),
-		...(config.recap.extraBody ? { samplingParams: { ...config.recap.extraBody } } : {}),
+		...(extraBody ? { samplingParams: { ...extraBody } } : {}),
 	} as RecapCompleteOptions;
 }
 
@@ -717,6 +762,8 @@ export type RunRecapOptions = {
 	signal?: AbortSignal;
 	showProgress?: boolean;
 	completeModel?: typeof complete;
+	/** Backoff between same-model retries. Tests pass 0 to stay fast. */
+	retryDelayMs?: number;
 };
 
 export async function runRecap(
@@ -727,7 +774,7 @@ export async function runRecap(
 	reason: RecapReason,
 	options: RunRecapOptions = {},
 ): Promise<RecapEntryData | undefined> {
-	const { force = false, signal, showProgress = true } = options;
+	const { force = false, signal, showProgress = true, retryDelayMs = RECAP_RETRY_DELAY_MS } = options;
 	const completeModel = resolveCompleteModel(ctx, options.completeModel);
 	if (state.running) return undefined;
 	if (ctx.mode !== "tui") {
@@ -771,68 +818,112 @@ export async function runRecap(
 
 	try {
 		const sessionId = readSessionId(ctx);
-		const headers = getOpenCodeSessionHeaders(model, sessionId);
 		let resolved: Extract<ResolvedRecapOutput, { ok: true }> | undefined;
 		let lastError: string | undefined;
+		let usedModel = model;
+		const attemptsByModel: { id: string; failures: number }[] = [];
 
-		// 失败先重试（见 RECAP_ATTEMPTS）；aborted 或被更新的 run 取代时立刻退出、不重试、不报错。
-		for (let attempt = 1; attempt <= RECAP_ATTEMPTS && !resolved; attempt++) {
-			if (attempt > 1) showRecapProgress(ctx, config, attempt);
-			let response: Awaited<ReturnType<typeof complete>> | undefined;
-			try {
-				response = await completeModel(
-					model,
-					{
-						systemPrompt: buildSystemPrompt(config),
-						messages: [
+		// 失败先重试（见 RECAP_ATTEMPTS，重试间隔见 RECAP_RETRY_DELAY_MS）；主模型重试耗尽后，
+		// 若配置了 recap.fallbackModel 则换模型再试一次。aborted 或被更新的 run 取代时
+		// 立刻退出、不重试、不报错。
+		const rounds: {
+			model: NonNullable<typeof model>;
+			attempts: number;
+			extraBody: Record<string, unknown> | undefined;
+			fallback: boolean;
+		}[] = [{ model, attempts: RECAP_ATTEMPTS, extraBody: config.recap.extraBody, fallback: false }];
+		const fallbackModel = resolveRuntimeFallbackModel(ctx, config, model);
+		if (fallbackModel) {
+			rounds.push({
+				model: fallbackModel,
+				attempts: 1,
+				extraBody: config.recap.fallbackExtraBody,
+				fallback: true,
+			});
+		}
+
+		for (const round of rounds) {
+			if (resolved) break;
+			if (round.fallback) showRecapProgress(ctx, config, 1, `fallback ${round.model.id}`);
+			const headers = getOpenCodeSessionHeaders(round.model, sessionId);
+			let failures = 0;
+
+			for (let attempt = 1; attempt <= round.attempts && !resolved; attempt++) {
+				if (attempt > 1) {
+					showRecapProgress(ctx, config, attempt);
+					if (retryDelayMs > 0) {
+						await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+					}
+					if (!isCurrentRecapRun(state, run)) return undefined;
+				}
+				let response: Awaited<ReturnType<typeof complete>> | undefined;
+				try {
+					response = await completeModel(
+						round.model,
+						{
+							systemPrompt: buildSystemPrompt(config),
+							messages: [
+								{
+									role: "user" as const,
+									content: [{ type: "text" as const, text: source.conversation }],
+									timestamp: Date.now(),
+								},
+							],
+						},
+						recapCompleteOptions(
+							config,
 							{
-								role: "user" as const,
-								content: [{ type: "text" as const, text: source.conversation }],
-								timestamp: Date.now(),
+								maxTokens: RECAP_MAX_TOKENS,
+								signal: runSignal,
+								sessionId,
+								headers,
 							},
-						],
-					},
-					recapCompleteOptions(config, {
-						maxTokens: RECAP_MAX_TOKENS,
-						signal: runSignal,
-						sessionId,
-						headers,
-					}),
-				);
-			} catch (error) {
-				if (runSignal?.aborted || state.activeRun !== run) return undefined;
-				lastError = error instanceof Error ? error.message : String(error);
+							round.extraBody,
+						),
+					);
+				} catch (error) {
+					if (runSignal?.aborted || state.activeRun !== run) return undefined;
+					lastError = error instanceof Error ? error.message : String(error);
+				}
+
+				if (!isCurrentRecapRun(state, run)) return undefined;
+				if (response?.stopReason === "aborted") return undefined;
+
+				// response 为空 == 上面 throw 过，lastError 里已经是真实原因，不要用空输出覆盖它
+				if (response) {
+					const raw = response.content
+						.filter((item): item is { type: "text"; text: string } => item.type === "text")
+						.map((item) => item.text)
+						.join("\n")
+						.trim();
+					const attemptResolved = resolveRecapOutput(raw, {
+						stopReason: response.stopReason,
+						errorMessage: response.errorMessage,
+						generateTitle: true,
+						titleMaxLength: TITLE_MAX_LENGTH,
+						recapMaxLength: RECAP_MAX_LENGTH,
+					});
+					if (attemptResolved.ok) {
+						resolved = attemptResolved;
+						usedModel = round.model;
+					} else {
+						lastError = attemptResolved.error;
+					}
+				}
+				if (!resolved) failures++;
 			}
 
-			if (!isCurrentRecapRun(state, run)) return undefined;
-			if (response?.stopReason === "aborted") return undefined;
-
-			// response 为空 == 上面 throw 过，lastError 里已经是真实原因，不要用空输出覆盖它
-			if (response) {
-				const raw = response.content
-					.filter((item): item is { type: "text"; text: string } => item.type === "text")
-					.map((item) => item.text)
-					.join("\n")
-					.trim();
-				const attemptResolved = resolveRecapOutput(raw, {
-					stopReason: response.stopReason,
-					errorMessage: response.errorMessage,
-					generateTitle: true,
-					titleMaxLength: TITLE_MAX_LENGTH,
-					recapMaxLength: RECAP_MAX_LENGTH,
-				});
-				if (attemptResolved.ok) resolved = attemptResolved;
-				else lastError = attemptResolved.error;
-			}
+			if (!resolved && failures > 0) attemptsByModel.push({ id: round.model.id, failures });
 		}
 
 		if (!resolved) {
 			if (lastError) {
-				displayRecapError(ctx, config, lastError);
+				displayRecapError(ctx, config, lastError, attemptsByModel);
 				displayed = true;
 			}
 			return undefined;
 		}
+
 
 		const { recap, title, titleSource } = resolved;
 		const appliedSessionName = shouldApplyTitle(title, pi, ctx, config, state);
@@ -850,7 +941,7 @@ export async function runRecap(
 			title,
 			titleSource,
 			reason,
-			model: formatModelName(model),
+			model: formatModelName(usedModel),
 			source: {
 				fromEntryId: source.fromEntryId,
 				toEntryId: source.toEntryId,
@@ -890,18 +981,27 @@ function clearRecapDisplay(ctx: ExtensionContext) {
 	ctx.ui.setWidget(WIDGET_KEY, undefined);
 }
 
-export function showRecapProgress(ctx: ExtensionContext, config: RecapConfig, attempt = 1) {
+export function showRecapProgress(ctx: ExtensionContext, config: RecapConfig, attempt = 1, note = "") {
 	clearRecapDisplay(ctx);
 	const retry = attempt > 1 ? ` retry ${attempt - 1}/${RECAP_ATTEMPTS - 1}` : "";
-	ctx.ui.setWidget(WIDGET_KEY, [`${WIDGET_PREFIX}Generating...${retry}`], { placement: WIDGET_PLACEMENT });
+	ctx.ui.setWidget(WIDGET_KEY, [`${WIDGET_PREFIX}Generating...${retry}${note}`], { placement: WIDGET_PLACEMENT });
 }
 
-export function displayRecapError(ctx: ExtensionContext, config: RecapConfig, message: string) {
+export function displayRecapError(
+	ctx: ExtensionContext,
+	config: RecapConfig,
+	message: string,
+	attemptsByModel?: { id: string; failures: number }[],
+) {
 	clearRecapDisplay(ctx);
+	const suffix =
+		attemptsByModel && attemptsByModel.length > 0
+			? ` [${attemptsByModel.map((entry) => `${entry.id}×${entry.failures}`).join(" → ")}]`
+			: "";
 	if (ctx.mode !== "tui") {
 		// RPC（pi-web 等）：factory 形式的 widget 不可见——错误用纯字符串行下发，
 		// 顺带把 showRecapProgress 留下的 "Generating..." 覆盖掉
-		ctx.ui.setWidget(WIDGET_KEY, [`${WIDGET_PREFIX}Failed — ${message}`], { placement: WIDGET_PLACEMENT });
+		ctx.ui.setWidget(WIDGET_KEY, [`${WIDGET_PREFIX}Failed${suffix} — ${message}`], { placement: WIDGET_PLACEMENT });
 		return;
 	}
 	ctx.ui.setWidget(
@@ -909,7 +1009,7 @@ export function displayRecapError(ctx: ExtensionContext, config: RecapConfig, me
 		(_tui, theme) =>
 			new Text(
 				theme.fg("muted", WIDGET_PREFIX) +
-					theme.fg("error", theme.bold("Failed")) +
+					theme.fg("error", theme.bold(`Failed${suffix}`)) +
 					"\n" +
 					theme.fg("error", message),
 				1,
@@ -1028,6 +1128,13 @@ function recapModelSelectItems(
 	});
 }
 
+export function fallbackModelSelectItems(
+	available: ReadonlyArray<RecapModelOption>,
+	configured: string,
+): SelectItem[] {
+	return [{ value: "none", label: "none" }, ...recapModelSelectItems(available, configured)];
+}
+
 export function settingItems(config: RecapConfig, options: RecapSettingsOptions): SettingItem[] {
 	const getConfig = options.getConfig ?? (() => config);
 	const availableModels = options.availableModels ?? [];
@@ -1065,6 +1172,19 @@ export function settingItems(config: RecapConfig, options: RecapSettingsOptions)
 					options.theme,
 					done,
 					{ preferredValue: getConfig().recap.model },
+				),
+		},
+		{
+			id: "recap.fallbackModel",
+			label: "Fallback model",
+			description: "Try this model once when the recap model fails all retries. 'none' disables the fallback.",
+			currentValue: config.recap.fallbackModel || "none",
+			submenu: (_current, done) =>
+				filterableSelect(
+					fallbackModelSelectItems(availableModels, getConfig().recap.fallbackModel),
+					options.theme,
+					done,
+					{ preferredValue: getConfig().recap.fallbackModel || "none" },
 				),
 		},
 	];
@@ -1143,6 +1263,9 @@ export function applyConfigSetting(config: RecapConfig, id: string, value: strin
 			break;
 		case "recap.fallbackToCurrentModel":
 			next.recap.fallbackToCurrentModel = on;
+			break;
+		case "recap.fallbackModel":
+			next.recap.fallbackModel = value.trim() === "none" ? "" : value.trim();
 			break;
 		case "recap.idleAfterTurnMs":
 			next.recap.idleAfterTurnMs = positiveNumber(Number(value), next.recap.idleAfterTurnMs);

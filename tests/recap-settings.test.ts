@@ -36,6 +36,7 @@ const ALL_SETTING_IDS = [
 	"recap.auto",
 	"recap.idleAfterTurnMs",
 	"recap.model",
+	"recap.fallbackModel",
 	"recap.fallbackToCurrentModel",
 	"recap.language",
 	"title.applyPolicy",

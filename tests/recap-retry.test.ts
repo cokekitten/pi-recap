@@ -133,6 +133,7 @@ test("transient provider error is retried once and then saves", async () => {
 	const result = await runRecap(harness.pi, harness.ctx, harness.config, harness.state, "manual", {
 		force: true,
 		completeModel: harness.completeModel,
+		retryDelayMs: 0,
 	});
 
 	assert.ok(result, "retry should let the recap through");
@@ -147,6 +148,7 @@ test("both attempts failing shows one failure and saves nothing", async () => {
 	const result = await runRecap(harness.pi, harness.ctx, harness.config, harness.state, "manual", {
 		force: true,
 		completeModel: harness.completeModel,
+		retryDelayMs: 0,
 	});
 
 	assert.equal(result, undefined);
@@ -178,6 +180,7 @@ test("a thrown error is retried and keeps its own message instead of empty-outpu
 	const result = await runRecap(harness.pi, harness.ctx, harness.config, harness.state, "manual", {
 		force: true,
 		completeModel: harness.completeModel,
+		retryDelayMs: 0,
 	});
 
 	assert.equal(result, undefined);
