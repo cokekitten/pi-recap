@@ -1,0 +1,10 @@
+# pnpm 11 default supply-chain policy requires packages to be >=24h old on npm.
+# @earendil-works/* 1.0.0 (the exact host pi this repo runs against daily) was
+# published 2026-10-01T19:03Z, just under the cutoff. Dev-deps here are pinned
+# for host parity, so relax the age gate for this repo. Feel free to delete
+# this override after the packages age past the cutoff.
+minimumReleaseAge: 0
+allowBuilds:
+  '@google/genai': true
+  esbuild: true
+  protobufjs: true
