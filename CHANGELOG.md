@@ -1,5 +1,24 @@
 # Changelog
 
+## Fork — herdr-core（`hc`）名称同步 (2026-11-16)
+
+上游只认两种外层多路复用器：Herdr pane（`HERDR_ENV=1` + `HERDR_PANE_ID`）和 tmux（`TMUX`）。当前环境换成了 herdr-core（`hc`），它只导出 `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET`，所以 `detectMultiplexer` 返回 `none` —— multiplexer 整条链路静默失效：不报错、不发命令、也不改名（连 `herdr-invalid` 那条告警都不会出现）。
+
+- 新增 `hc` / `hc-invalid` 两层检测：`HC_TERMINAL_ID` 存在即 `hc`；只有 `HC_TERMINAL_SOCKET` 而没有 id 则 `hc-invalid` 并告警一次。优先级 herdr → hc → tmux（hc 是 Herdr pane 模型的继任者，仍在 tmux 之内）。
+- `createHcAdapter`：capture / readCurrent 走 `hc get <id> --json`（校验 `address`，读 `labels.where`），apply 走 `hc label <id> where=<name>`，restore 写回原 `where`；原来没有该 label 时写 `where=` 删除，herdr-core 自己回落到显示当前目录。restore 前先读回当前值，保留上游「用户后来手动改名就不覆盖」的保护。
+- `where` 是 herdr-core 自己的显示标签（`项目 / 空间名`），改名会顶掉空间名，退出 / reload / 关闭同步时还原；二进制路径可用 `HC_BIN_PATH` 覆盖，默认 `hc`。
+- 新增 10 项测试（检测 2 项 + 契约与生命周期 8 项）。全量 103 项通过。
+- 真实环境实测（herdr-core 0.1.20）：临时终端上 `hc label t4x where=recap-probe` 后 `hc get` / `hc ls` 立即显示新值；`where=` 删除后 `ls` 输出不再带该键。
+
+## Fork — 运行时模型备援 (2026-10-02)
+
+- 新增 `recap.fallbackModel`（默认空）：主模型按 `RECAP_ATTEMPTS` 重试耗尽后，换该模型再试 1 次；备援轮用 `recap.fallbackExtraBody` 作为 `samplingParams`（两个模型的开关通常不同，例如给 deepseek 关思考，实测不带该参数服务器默认开思考）。
+- 同模型两次尝试之间加 `RECAP_RETRY_DELAY_MS = 8s` 退避：「集群负载较高」这类瞬时过载里立即重试大概率连续撞墙。
+- 失败行标注每个模型的尝试次数，例如 `Failed [minimax-m3×2 → deepseek-v4.1-flash×1]`，能一眼看出重试是否真的跑了。
+- 备援模型与主模型相同时直接返回 undefined（重试同一个模型没有意义），配置了这个键但 registry 里找不到时告警一次并继续不带备援。
+- 设置面板新增 Fallback model 选择项（`none` / `current` / 可用模型列表）。`tests/recap-fallback.test.ts` 覆盖以上行为。
+
+
 ## Fork — recap 失败自动重试一次 (2026-10-01)
 
 上游渠道偶发返回 **HTTP 200 + 空 completion**（SSE 里 `choices: []` + usage，没有 finish_reason），pi 的 openai-completions 会把它 resolve 成 `stopReason:"error"`（不是 reject），widget 直接显示 `Failed / Recap model failed: Stream ended without finish_reason`。这一层原本没有任何兜底：pi 的 `modelRegistry.complete` 就是 `stream(...).result()`，不注入 retry（`settings.retry` 只作用于交互轮次与压缩），网关侧 `RetryTimes=0` 也不跳渠道重试；而“200 + 无错误”在网关看来是成功，永远不触发渠道自动禁用。

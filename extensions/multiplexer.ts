@@ -34,6 +34,8 @@ export type MultiplexerHooks = {
 export type MultiplexerDetection =
 	| { kind: "herdr"; paneId: string }
 	| { kind: "herdr-invalid" }
+	| { kind: "hc"; terminalId: string }
+	| { kind: "hc-invalid" }
 	| { kind: "tmux" }
 	| { kind: "none" };
 
@@ -48,9 +50,15 @@ type HerdrSnapshot = {
 	originalLabel?: string;
 };
 
+type HcSnapshot = {
+	terminalId: string;
+	originalWhere?: string;
+};
+
 type SnapshotByKind = {
 	tmux: TmuxSnapshot;
 	herdr: HerdrSnapshot;
+	hc: HcSnapshot;
 };
 
 type MultiplexerKind = keyof SnapshotByKind;
@@ -101,6 +109,11 @@ export function detectMultiplexer(environment: MultiplexerEnvironment): Multiple
 		const paneId = environment.HERDR_PANE_ID?.trim();
 		return paneId ? { kind: "herdr", paneId } : { kind: "herdr-invalid" };
 	}
+	// herdr-core ("hc") exports HC_TERMINAL_ID into the programs it runs; it is the
+	// successor of Herdr's pane model, so it sits between Herdr and tmux.
+	const hcTerminalId = environment.HC_TERMINAL_ID?.trim();
+	if (hcTerminalId) return { kind: "hc", terminalId: hcTerminalId };
+	if (environment.HC_TERMINAL_SOCKET?.trim()) return { kind: "hc-invalid" };
 	if (environment.TMUX) return { kind: "tmux" };
 	return { kind: "none" };
 }
@@ -192,6 +205,72 @@ function createHerdrAdapter(runner: CommandRunner, paneId: string, command: stri
 					? ["pane", "rename", snapshot.paneId, "--clear"]
 					: ["pane", "rename", snapshot.paneId, snapshot.originalLabel],
 			);
+		},
+	};
+}
+
+function parseHcTerminal(
+	output: CommandOutput,
+	expectedTerminalId: string,
+): { terminalId: string; where?: string } {
+	let response: unknown;
+	try {
+		response = JSON.parse(output.stdout);
+	} catch {
+		throw new Error("hc get returned invalid JSON");
+	}
+
+	if (!isRecord(response)) throw new Error("hc get returned an unexpected response");
+	if (response.address !== expectedTerminalId) {
+		throw new Error(`hc get returned ${String(response.address)} instead of ${expectedTerminalId}`);
+	}
+	const labels = response.labels;
+	if (labels !== undefined && labels !== null && !isRecord(labels)) {
+		throw new Error("hc get returned invalid labels");
+	}
+	const where = isRecord(labels) ? labels.where : undefined;
+	if (where !== undefined && where !== null && typeof where !== "string") {
+		throw new Error("hc get returned an invalid where label");
+	}
+	return {
+		terminalId: expectedTerminalId,
+		where: typeof where === "string" ? where : undefined,
+	};
+}
+
+/**
+ * herdr-core names are the free-form "where" label: `hc ls` prints it as the
+ * terminal's place. There is no dedicated rename verb, so apply and restore
+ * write that one label and leave the herdr.* labels alone.
+ */
+function createHcAdapter(
+	runner: CommandRunner,
+	terminalId: string,
+	command: string,
+): MultiplexerAdapter<"hc"> {
+	async function getTerminal() {
+		return parseHcTerminal(await runner(command, ["get", terminalId, "--json"]), terminalId);
+	}
+
+	return {
+		kind: "hc",
+		async capture() {
+			const terminal = await getTerminal();
+			return { terminalId: terminal.terminalId, originalWhere: terminal.where };
+		},
+		async apply(snapshot, name) {
+			await runner(command, ["label", snapshot.terminalId, `where=${name}`]);
+		},
+		async readCurrent() {
+			return (await getTerminal()).where;
+		},
+		async restore(snapshot, restoreName) {
+			if (!restoreName) return;
+			await runner(command, [
+				"label",
+				snapshot.terminalId,
+				snapshot.originalWhere === undefined ? "where=" : `where=${snapshot.originalWhere}`,
+			]);
 		},
 	};
 }
@@ -300,6 +379,15 @@ export class MultiplexerManager {
 			);
 			return;
 		}
+		if (detection.kind === "hc-invalid") {
+			await this.release(true, hooks);
+			this.warnOnce(
+				"hc-invalid",
+				"Recap detected herdr-core, but HC_TERMINAL_ID is missing; outer multiplexers will not be modified.",
+				hooks,
+			);
+			return;
+		}
 		if (detection.kind === "none") {
 			await this.release(true, hooks);
 			return;
@@ -316,7 +404,13 @@ export class MultiplexerManager {
 					detection.paneId,
 					this.environment.HERDR_BIN_PATH?.trim() || "herdr",
 				)
-				: createTmuxAdapter(this.runner);
+				: detection.kind === "hc"
+					? createHcAdapter(
+						this.runner,
+						detection.terminalId,
+						this.environment.HC_BIN_PATH?.trim() || "hc",
+					)
+					: createTmuxAdapter(this.runner);
 			try {
 				const snapshot = await adapter.capture();
 				this.active = { adapter, snapshot } as ActiveMultiplexer;
@@ -353,6 +447,10 @@ export class MultiplexerManager {
 			await active.adapter.apply(active.snapshot as HerdrSnapshot, name);
 			return;
 		}
+		if (active.adapter.kind === "hc") {
+			await active.adapter.apply(active.snapshot as HcSnapshot, name);
+			return;
+		}
 		await active.adapter.apply(active.snapshot as TmuxSnapshot, name);
 	}
 
@@ -366,7 +464,9 @@ export class MultiplexerManager {
 			try {
 				const current = active.adapter.kind === "herdr"
 					? await active.adapter.readCurrent(active.snapshot as HerdrSnapshot)
-					: await active.adapter.readCurrent(active.snapshot as TmuxSnapshot);
+					: active.adapter.kind === "hc"
+						? await active.adapter.readCurrent(active.snapshot as HcSnapshot)
+						: await active.adapter.readCurrent(active.snapshot as TmuxSnapshot);
 				restoreName = current === active.lastAppliedName;
 			} catch (error) {
 				this.warnOnce(
@@ -380,6 +480,8 @@ export class MultiplexerManager {
 		try {
 			if (active.adapter.kind === "herdr") {
 				await active.adapter.restore(active.snapshot as HerdrSnapshot, restoreName);
+			} else if (active.adapter.kind === "hc") {
+				await active.adapter.restore(active.snapshot as HcSnapshot, restoreName);
 			} else {
 				await active.adapter.restore(active.snapshot as TmuxSnapshot, restoreName);
 			}

@@ -85,6 +85,46 @@ function createHerdrRunner(initialLabel: string | null = "shell") {
 	};
 }
 
+function hcJson(terminalId: string, where: string | undefined): string {
+	return JSON.stringify({
+		address: terminalId,
+		labels: where === undefined ? {} : { where },
+	});
+}
+
+function createHcRunner(initialWhere?: string) {
+	let where = initialWhere;
+	const calls: Call[] = [];
+	const runner: CommandRunner = async (command, args) => {
+		calls.push({ command, args: [...args] });
+		assert.equal(command, "hc");
+		if (args[0] === "get") {
+			assert.equal(args[1], "t7");
+			assert.equal(args[2], "--json");
+			return { stdout: hcJson("t7", where) };
+		}
+		if (args[0] === "label") {
+			assert.equal(args[1], "t7");
+			const assignment = args[2] ?? "";
+			assert.ok(assignment.startsWith("where="), "hc adapter writes the where label");
+			const value = assignment.slice("where=".length);
+			where = value === "" ? undefined : value;
+			return { stdout: "{}" };
+		}
+		throw new Error("Unexpected hc command: " + args.join(" "));
+	};
+	return {
+		runner,
+		calls,
+		get where() {
+			return where;
+		},
+		set where(value: string | undefined) {
+			where = value;
+		},
+	};
+}
+
 function createTmuxRunner(initialAutomaticRename = "on") {
 	let currentName = "shell";
 	let automaticRename = initialAutomaticRename;
@@ -546,4 +586,130 @@ test("no multiplexer environment performs no command or title side effect", asyn
 	assert.deepEqual(calls, []);
 	assert.deepEqual(ui.titles, []);
 	assert.deepEqual(ui.warnings, []);
+});
+
+test("detects herdr-core terminals through HC_TERMINAL_ID", () => {
+	assert.deepEqual(detectMultiplexer({ HC_TERMINAL_ID: "t7", TMUX: "/tmp/tmux,1,0" }), {
+		kind: "hc",
+		terminalId: "t7",
+	});
+});
+
+test("treats herdr-core without a terminal id as an invalid nearest layer", () => {
+	assert.deepEqual(
+		detectMultiplexer({ HC_TERMINAL_SOCKET: "/run/user/1000/herdr-core/default.sock", TMUX: "tmux" }),
+		{ kind: "hc-invalid" },
+	);
+});
+
+test("hc sync renames the where label and restores the original place", async () => {
+	const hc = createHcRunner("pi-expansion / RECAP");
+	const ui = createHooks();
+	const manager = new MultiplexerManager({
+		environment: { HC_TERMINAL_ID: "t7" },
+		runner: hc.runner,
+	});
+
+	await manager.sync(CONFIG, CONTEXT, ui.hooks);
+	assert.equal(hc.where, "auth refresh");
+	assert.deepEqual(ui.titles, ["auth refresh"]);
+
+	await manager.shutdown(CONFIG, "quit", ui.hooks);
+	assert.equal(hc.where, "pi-expansion / RECAP");
+	assert.equal(ui.warnings.length, 0);
+	assert.ok(hc.calls.every((call) => call.command === "hc"));
+});
+
+test("hc restore removes a where label the terminal did not have", async () => {
+	const hc = createHcRunner(undefined);
+	const ui = createHooks();
+	const manager = new MultiplexerManager({
+		environment: { HC_TERMINAL_ID: "t7" },
+		runner: hc.runner,
+	});
+
+	await manager.sync(CONFIG, CONTEXT, ui.hooks);
+	await manager.shutdown(CONFIG, "quit", ui.hooks);
+
+	assert.equal(hc.where, undefined);
+	assert.ok(hc.calls.some((call) => call.args.join(" ") === "label t7 where="));
+});
+
+test("manual hc rename is preserved on shutdown", async () => {
+	const hc = createHcRunner("pi-expansion / RECAP");
+	const ui = createHooks();
+	const manager = new MultiplexerManager({
+		environment: { HC_TERMINAL_ID: "t7" },
+		runner: hc.runner,
+	});
+
+	await manager.sync(CONFIG, CONTEXT, ui.hooks);
+	hc.where = "manual place";
+	await manager.shutdown(CONFIG, "quit", ui.hooks);
+
+	assert.equal(hc.where, "manual place");
+});
+
+test("uses HC_BIN_PATH when herdr-core provides a CLI path", async () => {
+	const commands: string[] = [];
+	let where = "old";
+	const runner: CommandRunner = async (command, args) => {
+		commands.push(command);
+		if (args[0] === "get") return { stdout: hcJson("t7", where) };
+		where = (args[2] ?? "").slice("where=".length);
+		return { stdout: "{}" };
+	};
+	const manager = new MultiplexerManager({
+		environment: { HC_TERMINAL_ID: "t7", HC_BIN_PATH: "/opt/herdr-core/hc" },
+		runner,
+	});
+
+	await manager.sync(CONFIG, CONTEXT, createHooks().hooks);
+	assert.equal(where, "auth refresh");
+	assert.ok(commands.every((command) => command === "/opt/herdr-core/hc"));
+});
+
+test("hc rejects invalid JSON and mismatched terminal ids", async () => {
+	for (const stdout of ["not-json", hcJson("t9", "elsewhere")]) {
+		const ui = createHooks();
+		const manager = new MultiplexerManager({
+			environment: { HC_TERMINAL_ID: "t7" },
+			runner: async () => ({ stdout }),
+		});
+		await manager.sync(CONFIG, CONTEXT, ui.hooks);
+		assert.equal(ui.titles.length, 0);
+		assert.equal(ui.warnings.length, 1);
+	}
+});
+
+test("invalid herdr-core identity warns once and never falls back to tmux", async () => {
+	const calls: Call[] = [];
+	const ui = createHooks();
+	const manager = new MultiplexerManager({
+		environment: { HC_TERMINAL_SOCKET: "/run/user/1000/herdr-core/default.sock", TMUX: "tmux" },
+		runner: async (command, args) => {
+			calls.push({ command, args });
+			return { stdout: "" };
+		},
+	});
+
+	await manager.sync(CONFIG, CONTEXT, ui.hooks);
+	await manager.sync(CONFIG, CONTEXT, ui.hooks);
+
+	assert.deepEqual(calls, []);
+	assert.equal(ui.warnings.length, 1);
+	assert.match(ui.warnings[0]!, /HC_TERMINAL_ID/);
+});
+
+test("disabling sync immediately restores an owned hc where label", async () => {
+	const hc = createHcRunner("pi-expansion / RECAP");
+	const manager = new MultiplexerManager({
+		environment: { HC_TERMINAL_ID: "t7" },
+		runner: hc.runner,
+	});
+	const ui = createHooks();
+
+	await manager.sync(CONFIG, CONTEXT, ui.hooks);
+	await manager.sync({ ...CONFIG, enabled: false }, CONTEXT, ui.hooks);
+	assert.equal(hc.where, "pi-expansion / RECAP");
 });

@@ -4,14 +4,16 @@
 
 **仓库：** https://github.com/cokekitten/pi-recap
 
-> **关于本仓库** —— 这是 [`@zhcsyncer/pi-recap`](https://github.com/zhcsyncer/pi-extensions/tree/main/packages/pi-recap)（`zhcsyncer/pi-extensions` monorepo 里的 `pi-recap` 包）的独立 fork，已对齐上游 **0.4.3**。只改了 recap 展示层，行为、配置、模型调用全部跟上游一致：
+> **关于本仓库** —— 这是 [`@zhcsyncer/pi-recap`](https://github.com/zhcsyncer/pi-extensions/tree/main/packages/pi-recap)（`zhcsyncer/pi-extensions` monorepo 里的 `pi-recap` 包）的独立 fork，已对齐上游 **0.4.3**。改动集中在 recap 展示层、herdr-core（`hc`）名称同步适配，以及两个 fork 自有配置项（`recap.extraBody` / `recap.fallbackModel`）；其余配置形状与模型调用跟上游一致：
 >
 > - **单行 recap widget**：成功态只输出一行紧凑文本 `※ recap  {时间} {recap}`，不再渲染多行块（标题 + 正文 + `Generated {时间}`）；
 > - **前缀改样式**：`RECAP  ` → `※ recap  `（generating / failed / success 三态统一）；fallback 标题的提示从 `WARNING  {text}` 改为 `⚠ {text}`；
 > - **widget 不再渲染标题**：标题仍然生成，仍然用于 session name 与 multiplexer 同步；
 > - **RPC 模式也能看到 recap**：非 TUI（`pi-web` 等 RPC 客户端）下 factory 形式的 widget 不可见，这里改为用纯字符串行下发进度、结果和错误。
->
-> 这四条行为由 `tests/fork-display.test.ts` 守住；rebase 到新上游后先跑这个文件。上游升级步骤：拷 `extensions/` + `tests/` + `examples/` + `README*` + `CHANGELOG.md`，重打本 patch，再 `npm test`。
+> - **herdr-core（`hc`）名称同步**：上游只认 Herdr pane（`HERDR_ENV=1` + `HERDR_PANE_ID`）和 tmux（`TMUX`）；herdr-core 的终端导出的是 `HC_TERMINAL_ID`，所以这里补上这一层，用 `hc label <id> where=<name>` 改写终端的 `where` 标签，reload / 关闭同步 / 退出时还原原值，之后手动改过名就不覆盖；`HC_BIN_PATH` 可覆盖 `hc` 二进制路径；
+> - **`recap.extraBody` 请求体透传**（fork 自有配置项）：原始 JSON 字段作为 pi 的 `StreamOptions.samplingParams` 合并进 recap 请求体，用于关掉 pi 不建模的 provider 思考，免得思考 token 吃掉 300 token 的输出预算（见「Turn off provider thinking」）；
+> - **重试 + 运行时模型备援**（`recap.fallbackModel` / `recap.fallbackExtraBody`）：失败后先退避 8s 重试一次，仍失败则换备援模型再试一次（备援轮用自己的 `samplingParams`）；aborted、被新 run 取代的情况不重试；失败行会标注每个模型试了几次，例如 `Failed [minimax-m3×2 → deepseek-v4.1-flash×1]`。
+> 上述行为分别由 `tests/fork-display.test.ts`（展示层）、`tests/recap-extra-body.test.ts`、`tests/recap-retry.test.ts`、`tests/recap-fallback.test.ts` 和 `tests/multiplexer.test.ts` 里的 `hc` 部分守住；rebase 到新上游后先跑这几个文件。上游升级步骤：拷 `extensions/` + `tests/` + `examples/` + `README*` + `CHANGELOG.md`，重打本 patch，再 `npm test`。
 
 `pi-recap` 是一个 Pi extension，用来生成**最近活动 recap**。它不是 compact，不会压缩或替换 LLM 上下文。
 

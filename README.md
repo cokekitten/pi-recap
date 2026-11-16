@@ -4,15 +4,16 @@
 
 **Repo:** https://github.com/cokekitten/pi-recap
 
-> **About this repo** — standalone fork of [`@zhcsyncer/pi-recap`](https://github.com/zhcsyncer/pi-extensions/tree/main/packages/pi-recap) (the `pi-recap` package in the `zhcsyncer/pi-extensions` monorepo), kept in sync with upstream **0.4.3**. Changes are the recap display layer plus one config escape hatch (`recap.extraBody`); everything else — behavior, config shape, and model calls — stays upstream's:
+> **About this repo** — standalone fork of [`@zhcsyncer/pi-recap`](https://github.com/zhcsyncer/pi-extensions/tree/main/packages/pi-recap) (the `pi-recap` package in the `zhcsyncer/pi-extensions` monorepo), kept in sync with upstream **0.4.3**. Changes are the recap display layer, a herdr-core (`hc`) name-sync adapter, and two fork-only knobs (`recap.extraBody`, `recap.fallbackModel`); everything else — config shape and model calls — stays upstream's:
 >
 > - **Single-line recap widget**: success rendering is one compact line — `※ recap  {time} {recap}` — instead of the multi-line block (title + body + `Generated {time}`).
 > - **Prefix restyle**: `RECAP  ` → `※ recap  ` (with the ※ marker) across the generating / failed / success states; the fallback-title warning renders as `⚠ {warning}` instead of `WARNING  {warning}`.
 > - **Title dropped from the widget**: the `data.title ?? "Recent activity"` heading is not rendered. The title is still generated and still drives session-name and multiplexer sync.
 > - **RPC modes show recap too**: in non-TUI modes (`pi-web` and other RPC clients) a factory-shaped widget is invisible, so progress, results, and errors are delivered as plain string lines instead of being skipped.
 > - **`recap.extraBody` request passthrough** (fork-only config key): raw JSON fields forwarded to the recap completion as pi's `StreamOptions.samplingParams`, which pi merges into the request body after its own named fields. Used to switch off provider-side thinking that pi does not model, so it cannot eat the recap output budget (see "Turn off provider thinking").
->
-> The first four behaviors are pinned by `tests/fork-display.test.ts`, the fifth by `tests/recap-extra-body.test.ts`; after rebasing onto a newer upstream, run those two files first. Upstream updates therefore drop in as: copy `extensions/` + `tests/` + `examples/` + `README*` + `CHANGELOG.md`, re-apply these patches, then `npm test`.
+> - **herdr-core (`hc`) name sync**: upstream detects only Herdr panes (`HERDR_ENV=1` + `HERDR_PANE_ID`) and tmux (`TMUX`). herdr-core terminals carry `HC_TERMINAL_ID` instead, so this fork detects that layer and renames the terminal's `where` label with `hc label <id> where=<name>`. The original place is restored on reload, disable, or shutdown, and a later manual rename is left alone. `HC_BIN_PATH` overrides the `hc` binary.
+> - **Retry and runtime model failover** (fork-only config keys `recap.fallbackModel` / `recap.fallbackExtraBody`): a failed recap is retried once after an 8 s backoff, then the fallback model gets one attempt with its own `samplingParams`. Aborted or superseded runs never retry, and the failure line names how often each model was tried (`Failed [minimax-m3×2 → deepseek-v4.1-flash×1]`).
+> Behavior is pinned by `tests/fork-display.test.ts` (display layer), `tests/recap-extra-body.test.ts`, `tests/recap-retry.test.ts`, `tests/recap-fallback.test.ts`, and the `hc` half of `tests/multiplexer.test.ts`; after rebasing onto a newer upstream, run those files first. Upstream updates therefore drop in as: copy `extensions/` + `tests/` + `examples/` + `README*` + `CHANGELOG.md`, re-apply these patches, then `npm test`.
 
 `pi-recap` is a Pi extension that generates a **recent activity recap**. It is not compaction and does not replace or shrink the LLM context.
 
